@@ -1,0 +1,313 @@
+---
+title: "Genomics and Bioinformatics: \nReproducing figures 2 and 3 from Article 7"
+author: 'Noé Prat'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## 1 - Introduction
+
+Tasmanian devils (*Sarcophilus Harrisii*) are endangered because of a contagious cancer called Devil Facial Tumour Disease (DFTD). In the article we are studying, the aim is to determine potential therapeutics for this disease. First, a drug assay on DFT cells is conducted, with seven different cathelicidins (called Saha_CATH1, Saha_CATH2, etc.), to measure which treatments are the most promising. The results are shown in the paper's first figure, which we will not address here.
+
+Secondly, the pathways impacted by cathelicidins are measured through the analysis of RNA sequencing data. Here we will try to reproduce their figures 2 and 3 by following the steps described in the Materials and Methods section.
+
+## 2 - Methods
+
+In the following part, major code chunks will be explained (most explanations are what is described in the article, so it will be explicitly said when we differ from the article, or when the article does not give exhaustive information).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache =TRUE)
+knitr::opts_chunk$set(fig.width=16, fig.height=10, figure.align = "center") 
+rm(list = ls())
+
+library(edgeR)
+library(readxl)
+library(limma)
+library(enrichplot)
+library(ggplot2)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(rtracklayer)
+library(EDASeq)
+library("RColorBrewer")
+
+```
+
+### 2.1 - Data Loading and filtering
+
+The data and metadata are loaded from the given files. Then, only the genes with more than 50 read counts are selected in order to keep a minimal statistical significance.
+
+```{r load_data}
+data <- read.csv("counts_final.csv", header=TRUE)
+metadata <- read_excel("metadata.xlsx")
+targets <- read.csv("Targets_SahaCATH.csv", header=TRUE)
+
+selected_samples <- targets$File.Name
+read_counts <- data.frame(data)
+
+```
+
+```{r data_preprocessing}
+sel_genes <- apply(read_counts[, selected_samples], 1, function(row) sum(row) > 50)
+filtered_read_counts <- read_counts[sel_genes,-c(3:6)]
+```
+
+### 2.2 - Normalization
+
+Trimmed Mean of M values (TMM) is first performed to compensate the discrepancies between library sizes.
+
+```{r norm_TMM, fig.width=25, fig.height=10}
+#dge <- DGEList(counts = filtered_read_counts[-2], group = targets$Treatment)
+
+par(mfrow=c(1,3))
+dge <- DGEList(counts = filtered_read_counts, group = targets$Treatment)
+barplot(dge$samples$lib.size, names=colnames(dge), las=2, main="Library sizes")
+
+
+TMM_dge <- normLibSizes(dge, method = "TMM") #DGEList
+effective_lib_sizes = TMM_dge$samples$lib.size / TMM_dge$samples$norm.factors
+barplot(effective_lib_sizes, names=colnames(TMM_dge), las=2, main="Effective library sizes (after TMM)")
+
+
+
+logcounts <- cpm(TMM_dge, log=TRUE)
+# Check distributions of samples using boxplots
+boxplot(logcounts, 
+        xlab="", 
+        ylab="Log2 counts per million",
+        main = "boxplots of samples after TMM",
+        las=2)
+# Let's add a blue horizontal line that corresponds to the median logCPM
+abline(h=median(logcounts), col="blue")
+
+```
+A MDS plot is shown to visualize the data on reduced dimensions. Each color corresponds to a treatment : "control" or "Saha_CATH_n".
+Saha_CATH3, 4, 5, 6 are well isolated.
+```{r MDS}
+col.treatment = brewer.pal(n=8, name='Dark2')[TMM_dge$samples$group]
+
+plotMDS(TMM_dge, col = col.treatment, main = 'MDS plot')
+
+```
+Then upper-quartile normalization is performed.
+```{r norm_uq, warning=FALSE}
+
+library(EDASeq)
+
+uq_norm <- betweenLaneNormalization(TMM_dge$counts, which="upper")
+
+uq_norm_dge <- DGEList(uq_norm, group = targets$Treatment)
+
+uq_norm_dge$genes <- dge$genes
+
+```
+
+### 2.3 - Differential Expression analysis
+
+
+```{r dge}
+# model matrix
+design <- model.matrix(~ 0 + targets$Treatment)
+colnames(design) <- make.names(colnames(design), unique = FALSE, allow_ = TRUE)
+
+# transform into log2 cpm
+v <- voom(uq_norm_dge, design, plot = TRUE)
+geneplotter::multidensity(v$E[, c(1, 5, 10, 15)], main = "Read count distributions", las = 1, xlab = "Read counts [log2 counts per million]")
+
+# fitting model with limma
+fit <- lmFit(v, design)
+```
+
+### 2.4 - Gene Ontology analysis
+
+Defining a function to apply a False Discovery Rate (FDR) of 0.02, and a 1.5 Fold Change (FC) threshold. This function will be used to select the genes used in GO.
+```{r gene_list}
+
+extract_gene_list <- function(treatment, direction, fit, FDR = 0.02, logFC_threshold = log2(1.5)) {
+  
+  # contrast matrix for the specified treatment
+  cont.matrix <- makeContrasts(
+    contrasts = paste0("targets.TreatmentSaha.",
+                       treatment,
+                             "-targets.TreatmentControl"),
+                               levels = colnames(coef(fit)))
+  
+  fit2 <- contrasts.fit(fit, cont.matrix)
+  fit2 <- eBayes(fit2)
+  
+  res <- topTable(fit2, n = Inf, adjust.method = "BH", sort.by = "none")
+  
+  # FDR filtering
+  filtered_res_pval <- subset(res, adj.P.Val < FDR)
+  
+  # selecting up/down regulated genes
+  if (direction == "upregulated") {
+    filtered_res <- subset(filtered_res_pval, logFC > logFC_threshold)
+  } else if (direction == "downregulated") {
+    filtered_res <- subset(filtered_res_pval, logFC < -logFC_threshold)
+  } else {
+    stop("Invalid direction. Please specify 'upregulated' or 'downregulated'.")
+  }
+  
+  # Return the list of genes
+  return(filtered_res$GENE_ID)
+}
+
+
+```
+
+Importing a reference genome.
+
+```{r ref_genome}
+ref_genome <- import.gff("GCF_000189315.1_Devil_ref_v7.0_genomic.gff")
+
+# removing NAs and redundancies
+ref_genome_unique <- ref_genome[!is.na(ref_genome$gene),]
+ref_genome_unique <- ref_genome_unique[!duplicated(ref_genome_unique$gene),]
+
+
+```
+
+Defining the GO analysis function. Over-representation analysis is performed in the `enrichGO` function from the `ClusterProfiler` package. The p-values were adjusted with the Benjamini-Hochberg method, keeping only terms below 0.05, and gene sets smaller than 200. The article did not precise the subontology considered, so we chose "BP".
+
+```{r GO_function, warning=FALSE}
+
+GO_analysis <- function(gene_list, ref_genome=ref_genome_unique){
+  
+  # perform GO analysis
+  ora <- enrichGO(gene = gene_list, #genes to check
+                  OrgDb = org.Hs.eg.db, # homo sapiens annotated genes db since the gff file is mapped to the human genome
+                  keyType = "SYMBOL", #cf metadata
+                  pvalueCutoff = 0.05, #adjusted p value threshold
+                  pAdjustMethod = "BH", #Benjamini Hochberg adjustment
+                  ont = "BP", #biological process subontology
+                  universe = ref_genome@elementMetadata$gene, #Background genes from Tasmanian Devil data
+                  maxGSSize = 200
+                  )
+  
+  #remove groups with more than 200 counts
+  ora@result <- ora@result[ora@result$Count <= 200, ]
+  
+  #Simplify
+  ora <- simplify(ora)
+  
+  return(ora)
+  
+}
+
+```
+
+## 3 - Results
+
+### 3.1 - GO analysis
+
+In this part, we try to reproduce Figures 2 and 3 from the article.
+
+```{r disp_function}
+bp <- function(data, title, cats){
+  par(mar=c(1,5,1,1))
+  x <- barplot(data, drop = TRUE, showCategory = cats, title = title)
+  print(x)
+}
+```
+
+
+#### Figure 2.a) GO analysis for down-regulated genes with CATH 3 treatment
+
+```{r GO_downreg_CATH3}
+GO_analysis_down_CATH_3 <- GO_analysis(extract_gene_list("CATH3", "downregulated", fit))
+
+bp(GO_analysis_down_CATH_3,title = "Downregulated genes (CATH 3)", cats= 15)
+```
+Like in the article, we find that the main categories are related to DNA replication or proteoglycans, however the labels do not match perfectly (and this is the case for all the other figures). It seems that the article used a more specific subontology (related to neurons perhaps ?).
+
+
+#### Figure 2.b) GO analysis for down-regulated genes with CATH 4 treatment
+
+```{r GO_downreg_CATH4}
+GO_analysis_down_CATH_4 <- GO_analysis(extract_gene_list("CATH4", "downregulated", fit))
+
+bp(GO_analysis_down_CATH_4,title = "Downregulated genes (CATH 4)", cats= 20)
+```
+Both figures highlight Saha CATH4's impact on DNA replication and mitosis.
+
+
+
+#### Figure 2.c) GO analysis for down-regulated genes with CATH 5 treatment
+
+```{r GO_downreg_CATH5}
+GO_analysis_down_CATH_5 <- GO_analysis(extract_gene_list("CATH5", "downregulated", fit))
+
+bp(GO_analysis_down_CATH_5,title = "Downregulated genes (CATH 5)", cats= 15)
+```
+Both figures highlight Saha CATH5's impact on DNA repair mechanisms (which is meaningful when trying to find drugs for a cancer).
+
+
+
+#### Figure 3.a) GO analysis for up-regulated genes with CATH 6 treatment
+
+```{r GO_upreg_CATH6}
+GO_analysis_up_CATH_6 <- GO_analysis(extract_gene_list("CATH6", "upregulated", fit))
+
+bp(GO_analysis_up_CATH_6,title = "Upregulated genes (CATH 6)", cats= 15)
+
+```
+Both figures highlight Saha CATH6's impact on DNA repair mechanisms (which is meaningful when trying to find drugs for a cancer).
+
+
+
+
+#### Figure 3.b) GO analysis for down-regulated genes with CATH 6 treatment
+
+This figure fails, we commented it to be able to knit the rest of the document.
+
+```{r GO_downreg_CATH6}
+# bugs preventing from knitting the entire document
+
+#GO_analysis_down_CATH_6 <- GO_analysis(extract_gene_list("CATH6", "downregulated", fit))
+
+#bp(GO_analysis_down_CATH_6, title = "Downregulated genes (CATH 6)", cats= 15)
+```
+
+### 3.2 - Volcano plots
+
+```{r volcano_function}
+VolcanoPlot <- function(myDGE=res, col_log2FC=res$log2FoldChange, col_pval=res$padj, title = NULL){
+  mycol_genes                                             <- rep(rgb(0.7,0.7,0.7,0.2))
+  mycol_genes[abs(col_log2FC)>=1.0&col_pval<=0.05]<- rep(rgb(0.0,0.0,0.0,0.2))
+  plot(col_log2FC,-log10(col_pval),pch=19,cex=0.3,col=mycol_genes,xlab="log2FC",ylab="-log10(P-value)",frame=FALSE, main=title)
+  abline(h=-log10(0.01),lty=2,col="grey")
+  abline(v=c(-1,1),lty=2,col="grey")
+} 
+```
+
+```{r volcano_plot}
+
+treatments <- c("CATH1", "CATH2", "CATH3", "CATH4", "CATH5", "CATH6", "CATH7")
+
+for (treatment in treatments) {
+  
+  # current contrast matrix
+  cont.matrix <- makeContrasts(
+    contrasts = paste0("targets.TreatmentSaha.", treatment, "-targets.TreatmentControl"),
+    levels = colnames(coef(fit))
+  )
+  
+  fit2 <- contrasts.fit(fit, cont.matrix)
+  
+  # empirical bayes smoothing
+  fit2 <- eBayes(fit2)
+  
+  res <- topTable(fit2, coef = 1, number = Inf, adjust.method = "BH", sort.by = "none")
+  
+  VolcanoPlot(res, col_log2FC = res$logFC, col_pval = res$adj.P.Val, title = treatment)
+}
+
+
+```
+
+## Conclusion
+We managed to reproduce similar figures, however the labels are never exactly the same, and the gene counts are often different. This could be explained by steps that were not disclosed in the article: for instance the subontology chosen or additional parameters. Another possible explanation is that something went wrong in our workflow: my intuition tells me that it could be related to the TMM normalized counts not being considered downstream.
